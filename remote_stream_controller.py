@@ -1,239 +1,173 @@
 #!/usr/bin/env python3
-"""
-Remote dual-camera client:
-- Captures two frames (external + gripper), makes ONE composite image
-- Sends (prompt + image) to /predict
-- Receives action vector, applies scaling/safety/adapter
-- Commands robot joints
-- Measures and reports achieved loop frequency (Hz)
+import argparse, io, os, time
+from typing import Optional, Tuple
 
-Dependencies:
-  pip install opencv-python requests pillow numpy
-
-Local modules expected (already in your repo):
-  - improved_soarm_interface.ImprovedSOARMInterface
-  - openvla_6motor_adapter.OpenVLA6MotorAdapter
-  - soarm_safety_system.SOARMSafetySystem
-"""
-
-import argparse
-import io
-import time
-import sys
-import requests
-import numpy as np
 import cv2
-from PIL import Image
+import numpy as np
+import requests
 
-# ---- Local robot stack (your existing files) ----
-from improved_soarm_interface import ImprovedSOARMInterface
-from soarm_safety_system import SOARMSafetySystem
-from openvla_6motor_adapter import OpenVLA6MotorAdapter
+API_TIMEOUT = (3.0, 10.0)  # (connect, read)
 
+def _open_cam(idx: int, w: int = 1280, h: int = 720, retries: int = 10) -> Optional[cv2.VideoCapture]:
+    if idx is None or idx < 0:
+        return None
+    cap = None
+    for _ in range(retries):
+        cap = cv2.VideoCapture(idx, cv2.CAP_V4L2)
+        if cap.isOpened():
+            # Try to set resolution; ignore if backend refuses
+            cap.set(cv2.CAP_PROP_FRAME_WIDTH, w)
+            cap.set(cv2.CAP_PROP_FRAME_HEIGHT, h)
+            return cap
+        if cap:
+            cap.release()
+        time.sleep(0.2)
+    return None
 
-def _open_cam(idx: int, width: int = 1280, height: int = 720, fps: int = 30):
-    cap = cv2.VideoCapture(idx, cv2.CAP_ANY)
-    cap.set(cv2.CAP_PROP_FRAME_WIDTH,  width)
-    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, height)
-    cap.set(cv2.CAP_PROP_FPS,          fps)
-    if not cap.isOpened():
-        raise RuntimeError(f"Camera {idx} failed to open")
-    return cap
+def _read_frame(cap: cv2.VideoCapture) -> Optional[np.ndarray]:
+    ok, frame = cap.read()
+    if not ok or frame is None:
+        return None
+    return frame
 
-
-def _composite_bgr(ext_bgr, grip_bgr, comp_h: int) -> np.ndarray:
-    """
-    Make a single horizontal composite at target height comp_h.
-    Keeps aspect ratio of each source, pads to same height, concatenates.
-    """
-    def _resize_h(img, h):
-        h0, w0 = img.shape[:2]
-        scale = h / float(h0)
-        w = int(w0 * scale)
-        return cv2.resize(img, (w, h), interpolation=cv2.INTER_AREA)
-
-    ext = _resize_h(ext_bgr, comp_h)
-    grip = _resize_h(grip_bgr, comp_h)
-    return cv2.hconcat([ext, grip])
-
-
-def _jpeg_bytes_from_bgr(bgr: np.ndarray, quality: int = 90) -> bytes:
-    ok, enc = cv2.imencode(".jpg", bgr, [int(cv2.IMWRITE_JPEG_QUALITY), quality])
+def _encode_jpeg(img: np.ndarray, quality: int = 90) -> bytes:
+    ok, buf = cv2.imencode(".jpg", img, [int(cv2.IMWRITE_JPEG_QUALITY), quality])
     if not ok:
         raise RuntimeError("JPEG encode failed")
-    return enc.tobytes()
+    return buf.tobytes()
 
+def _hstack_or_single(grip: Optional[np.ndarray], ext: Optional[np.ndarray], comp_h: int) -> np.ndarray:
+    if grip is None and ext is None:
+        raise RuntimeError("No frames available")
+    if ext is None:
+        img = grip
+    elif grip is None:
+        img = ext
+    else:
+        # Pad heights then hstack
+        h = max(grip.shape[0], ext.shape[0])
+        def pad_to_h(x):
+            if x.shape[0] == h:
+                return x
+            pad = h - x.shape[0]
+            return cv2.copyMakeBorder(x, 0, pad, 0, 0, cv2.BORDER_REPLICATE)
+        img = np.hstack([pad_to_h(grip), pad_to_h(ext)])
 
-def _safe_clip(v: float, lo: float, hi: float) -> float:
-    return float(np.clip(v, lo, hi))
-
+    # Resize to requested composite height (preserve aspect)
+    ratio = comp_h / img.shape[0]
+    comp_w = int(round(img.shape[1] * ratio))
+    return cv2.resize(img, (comp_w, comp_h), interpolation=cv2.INTER_AREA)
 
 def main():
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--server", required=True, help="Base URL, e.g. http://HOST:8000")
-    ap.add_argument("--prompt", default="move to the object")
-    ap.add_argument("--gripper-cam", type=int, default=0)
-    ap.add_argument("--external-cam", type=int, default=2)
-    ap.add_argument("--hz", type=float, default=5.0)
-    ap.add_argument("--duration", type=float, default=30.0)
-    ap.add_argument("--scale", type=float, default=12.0, help="Overall gain applied after OpenVLA vector")
-    ap.add_argument("--comp-h", type=int, default=720, help="Composite image height")
-    ap.add_argument("--quiet", action="store_true", help="Minimal per-step logs")
-    ap.add_argument("--timeout", type=float, default=2.5, help="Server HTTP timeout (s)")
-    args = ap.parse_args()
+    p = argparse.ArgumentParser()
+    p.add_argument("--server", required=True, help="http://HOST:PORT")
+    p.add_argument("--prompt", required=True)
+    p.add_argument("--gripper-cam", type=int, default=0)
+    p.add_argument("--external-cam", type=int, default=-1, help="-1 disables external cam")
+    p.add_argument("--hz", type=float, default=5.0)
+    p.add_argument("--duration", type=float, default=30.0)
+    p.add_argument("--scale", type=float, default=12.0)
+    p.add_argument("--comp-h", type=int, default=720)
+    p.add_argument("--cam-w", type=int, default=1280)
+    p.add_argument("--cam-h", type=int, default=720)
+    p.add_argument("--print-every", type=int, default=10, help="print loop rate every N steps")
+    args = p.parse_args()
 
-    # --- Health check (non-fatal) ---
+    # Health
     try:
-        r = requests.get(f"{args.server.rstrip('/')}/health", timeout=3.0)
-        print(f"Health: {r.json()}")
+        r = requests.get(f"{args.server}/health", timeout=API_TIMEOUT)
+        print("Health:", r.json())
     except Exception as e:
-        print(f"Health: {{'ok': False, 'error': '{e}'}}")
+        print("⚠️  Health check failed:", e)
 
-    # --- Cameras ---
-    print("📹 Initializing Dual Camera System...")
-    ext_cap = _open_cam(args.external-cam if hasattr(args, 'external-cam') else args.external_cam)
-    grip_cap = _open_cam(args.gripper-cam if hasattr(args, 'gripper-cam') else args.gripper_cam)
-    print("✅ Dual camera system ready!")
+    print("📹 Initializing camera(s)...")
+    grip_cap = _open_cam(args.gripper_cam, args.cam_w, args.cam_h)
+    ext_cap = _open_cam(args.external_cam, args.cam_w, args.cam_h) if args.external_cam >= 0 else None
 
-    # --- Robot & Safety ---
-    safety = SOARMSafetySystem()
-    robot = ImprovedSOARMInterface(port="/dev/ttyACM_soarm_leader")  # auto-detected in your stack
-    adapter = OpenVLA6MotorAdapter(method="simple_mapping")
+    if grip_cap is None and ext_cap is None:
+        raise RuntimeError("No camera opened (gripper and external both unavailable). "
+                           "Try changing indexes or unplug/plug cameras.")
 
-    target_dt = 1.0 / max(args.hz, 0.1)
-    t_start = time.time()
-    t_prev = t_start
+    if ext_cap is None:
+        print("✅ Running in SINGLE-CAM mode (gripper only).")
+    else:
+        print("✅ Running in DUAL-CAM mode (gripper + external).")
 
-    # EMA for achieved Hz
-    ema_alpha = 0.1
-    ema_dt = None
+    period = 1.0 / max(0.1, args.hz)
+    t_end = time.time() + args.duration
 
     step = 0
-    moves = 0
-    errors = 0
+    last_print = time.perf_counter()
+    since_print = 0
 
-    print(f"🚀 Remote control started for {args.duration:.1f}s @ {args.hz:.1f} Hz")
-    print(f"📝 Prompt: {args.prompt}")
+    while time.time() < t_end:
+        t0 = time.perf_counter()
 
-    try:
-        while True:
-            now = time.time()
-            if now - t_start >= args.duration:
-                break
+        grip = _read_frame(grip_cap) if grip_cap else None
+        ext = _read_frame(ext_cap) if ext_cap else None
 
-            # ---- Tick start ----
-            loop_t0 = time.time()
+        if grip is None and ext is None:
+            # brief backoff; keep loop alive
+            time.sleep(0.01)
+            continue
 
-            # Capture
-            ok1, ext_bgr = ext_cap.read()
-            ok2, grip_bgr = grip_cap.read()
-            if not (ok1 and ok2):
-                if not args.quiet:
-                    print("⚠️ Camera read failed; skipping tick")
-                time.sleep(min(target_dt, 0.01))
-                continue
+        comp = _hstack_or_single(grip, ext, args.comp_h)
+        jpg = _encode_jpeg(comp, quality=88)
 
-            comp_bgr = _composite_bgr(ext_bgr, grip_bgr, args.comp_h)
-            jpg = _jpeg_bytes_from_bgr(comp_bgr, quality=85)
+        files = {
+            "image": ("frame.jpg", io.BytesIO(jpg), "image/jpeg")
+        }
+        data = {"prompt": args.prompt}
 
-            # Predict
-            try:
-                resp = requests.post(
-                    f"{args.server.rstrip('/')}/predict",
-                    data={"prompt": args.prompt},
-                    files={"image": ("comp.jpg", jpg, "image/jpeg")},
-                    timeout=args.timeout
+        t_req0 = time.perf_counter()
+        try:
+            resp = requests.post(f"{args.server}/predict", files=files, data=data, timeout=API_TIMEOUT)
+            resp.raise_for_status()
+            out = resp.json()
+        except Exception as e:
+            print(f"❌ POST /predict error: {e}")
+            out = None
+        t_req1 = time.perf_counter()
+
+        if out and out.get("ok"):
+            action = out.get("action", [])
+            timings = out.get("timings", {})
+            # Minimal clean log:
+            if (step % args.print_every) == 0:
+                print(
+                    f"Step {step:04d}  "
+                    f"preproc={timings.get('preproc_ms', '?')}ms  "
+                    f"infer={timings.get('infer_ms', '?')}ms  "
+                    f"total={timings.get('total_ms', '?')}ms  "
+                    f"net={(t_req1 - t_req0)*1000:.1f}ms  "
+                    f"act={np.array(action, dtype=float)[:5].round(2).tolist()}..."
                 )
-                if resp.status_code != 200:
-                    raise RuntimeError(f"Server {resp.status_code}: {resp.text[:200]}")
-                payload = resp.json()
-                if not payload.get("ok", False):
-                    raise RuntimeError(payload.get("error", "Unknown server error"))
+        else:
+            if (step % args.print_every) == 0:
+                print(f"Step {step:04d}  no response / error")
 
-                ova = payload["action"]  # OpenVLA raw action list
-            except Exception as e:
-                errors += 1
-                if not args.quiet:
-                    print(f"❌ predict_action failed: {e}")
-                time.sleep(min(target_dt, 0.01))
-                continue
+        step += 1
+        since_print += 1
 
-            # Post-process -> scale + clamp (soft), then safety + adapter
-            ova = np.array(ova, dtype=np.float32)
+        # pacing
+        t1 = time.perf_counter()
+        dt = t1 - t0
+        if dt < period:
+            time.sleep(period - dt)
 
-            # Simple global scale then per-joint soft clamp
-            scaled = ova * args.scale
-            # optional per-index soft clamps (rad-ish), conservative
-            limits = [
-                (-1.0, 1.0),  # shoulder_pan
-                (-1.0, 1.0),  # shoulder_lift
-                (-1.0, 1.0),  # elbow_flex
-                (-1.0, 1.0),  # wrist_flex
-                (-1.2, 1.2),  # wrist_roll
-                (-2.0, 2.0),  # gripper (will be re-mapped in your interface)
-            ]
-            for i in range(min(len(scaled), len(limits))):
-                lo, hi = limits[i]
-                scaled[i] = _safe_clip(scaled[i], lo, hi)
+        # show achieved loop rate periodically
+        if (step % args.print_every) == 0:
+            now = time.perf_counter()
+            elapsed = now - last_print
+            hz = since_print / max(1e-6, elapsed)
+            print(f"📈 loop ~ {hz:.2f} Hz over last {since_print} steps")
+            last_print = now
+            since_print = 0
 
-            # Adapter -> joint space
-            joints = adapter.convert(scaled)
-
-            # Safety clamp to hardware limits
-            safe_joints = safety.clamp_to_limits(joints)
-
-            # Move robot (non-blocking in your driver)
-            moved = robot.move_joints(safe_joints, duration=target_dt)
-            moves += 1 if moved else 0
-
-            # ---- Tick end & telemetry ----
-            step += 1
-            loop_dt = time.time() - loop_t0
-            ema_dt = loop_dt if ema_dt is None else (1 - ema_alpha) * ema_dt + ema_alpha * loop_dt
-            achieved_hz = (1.0 / ema_dt) if ema_dt and ema_dt > 0 else 0.0
-
-            if step % 5 == 0:
-                # compact per-5-step log
-                if not args.quiet:
-                    j = safe_joints
-                    print(
-                        f"Step {step:04d}: move={'Y' if moved else 'N'} "
-                        f"Hz≈{achieved_hz:4.1f} "
-                        f"J=[{j[0]:+0.2f},{j[1]:+0.2f},{j[2]:+0.2f},{j[3]:+0.2f},{j[4]:+0.2f}] "
-                        f"G={j[5]:+0.2f}"
-                    )
-
-            # pacing
-            sleep_left = target_dt - (time.time() - loop_t0)
-            if sleep_left > 0:
-                time.sleep(sleep_left)
-
-    except KeyboardInterrupt:
-        print("\n🛑 Stopped by user.")
-    finally:
-        # Cleanup
-        try:
-            ext_cap.release()
-            grip_cap.release()
-        except Exception:
-            pass
-        try:
-            robot.disable_all()
-            robot.disconnect()
-        except Exception:
-            pass
-
-        total = max(time.time() - t_start, 1e-6)
-        avg_hz = step / total
-        print("📊 Summary")
-        print(f"  Steps:       {step}")
-        print(f"  Moves:       {moves}")
-        print(f"  Errors:      {errors}")
-        print(f"  Duration(s): {total:.2f}")
-        print(f"  Achieved Hz: {avg_hz:.2f} (EMA≈{achieved_hz:.2f})")
-
+    # cleanup
+    if grip_cap: grip_cap.release()
+    if ext_cap: ext_cap.release()
+    print("✅ Done.")
 
 if __name__ == "__main__":
-    # Make argparse friendlier when copy/pasting with backslashes
-    sys.argv = [a for a in sys.argv if a != "\\"]
     main()

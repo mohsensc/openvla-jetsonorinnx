@@ -1,78 +1,61 @@
 #!/usr/bin/env python3
-"""
-Minimal OpenVLA inference server.
-
-Endpoints:
-  GET  /health
-  POST /predict   -> multipart/form-data with fields:
-                      - prompt: str
-                      - image: 1 RGB image (client composes multi-cam if needed)
-
-Notes
-- Single image per request to keep processor batching simple.
-- Returns: { ok, action: [floats], timings: {...} }
-"""
-
-import io
-import os
-import time
+import io, os, time
 from pathlib import Path
-from typing import Any
+from typing import Optional, Dict, Any
 
 from fastapi import FastAPI, UploadFile, Form
 from fastapi.responses import JSONResponse
 from PIL import Image
 import torch
 from transformers import (
-    AutoProcessor,
-    AutoModelForVision2Seq,
     AutoConfig,
     AutoImageProcessor,
+    AutoProcessor,
+    AutoModelForVision2Seq,
 )
 
-# -----------------------------
-# Configuration & local caches
-# -----------------------------
+# -------------------- Model + cache setup --------------------
 MODEL_ID = os.environ.get("OPENVLA_MODEL", "openvla/openvla-7b")
+REVISION = os.environ.get(
+    "OPENVLA_REVISION",
+    "31f090d05236101ebfc381b61c674dd4746d4ce0",  # pin to avoid surprise code updates
+)
 
-# Create repo-local HF caches so we never touch /cache
-HF_BASE = Path(__file__).parent / ".hf_cache"
+BASE = Path(__file__).parent
+HF_BASE = BASE / ".hf_cache"
 (HF_BASE / "hub").mkdir(parents=True, exist_ok=True)
 (HF_BASE / "transformers").mkdir(parents=True, exist_ok=True)
 (HF_BASE / "datasets").mkdir(parents=True, exist_ok=True)
 
-# Respect user-provided envs, otherwise default to local dirs
 os.environ.setdefault("HF_HOME", str(HF_BASE))
 os.environ.setdefault("HF_HUB_CACHE", str(HF_BASE / "hub"))
 os.environ.setdefault("TRANSFORMERS_CACHE", str(HF_BASE / "transformers"))
 os.environ.setdefault("HF_DATASETS_CACHE", str(HF_BASE / "datasets"))
+
+# Allow fully offline after first snapshot if desired: export HF_LOCAL_ONLY=1
+LOCAL_ONLY = os.environ.get("HF_LOCAL_ONLY", "0") == "1"
 CACHE_DIR = os.environ.get("TRANSFORMERS_CACHE", str(HF_BASE / "transformers"))
 
-# No gradients needed for inference
 torch.set_grad_enabled(False)
-
 app = FastAPI(title="OpenVLA Server", version="1.1")
 
 
-def _cuda_bf16_supported() -> bool:
-    # Compatible with older/newer torch
-    try:
-        fn = getattr(torch.cuda, "is_bf16_supported", None)
-        return bool(fn()) if callable(fn) else False
-    except Exception:
-        return False
-
-
-def _device_info() -> dict[str, Any]:
+def _device_info():
     cuda = torch.cuda.is_available()
     dev = torch.device("cuda:0" if cuda else "cpu")
+    try:
+        is_bf16_supported = bool(getattr(torch.cuda, "is_bf16_supported", lambda: False)())
+    except Exception:
+        is_bf16_supported = False
     return {
         "ok": True,
         "device": str(dev),
-        "attn": "sdpa" if cuda else "default",
-        "bf16": _cuda_bf16_supported(),
+        "attn": "eager",  # we force eager below to dodge sdpa/flash checks
+        "bf16": is_bf16_supported,
         "model": MODEL_ID,
         "torch": torch.__version__,
+        "revision": REVISION,
+        "local_only": LOCAL_ONLY,
     }
 
 
@@ -83,65 +66,83 @@ class Model:
     dtype = None
 
 
-@app.on_event("startup")
-def load_model():
-    # Optional: register prismatic classes (no-op if already registered)
+def _force_eager_attention():
+    # Disable PyTorch SDPA paths so HF won't try to auto-pick them.
     try:
-        from prismatic_hf.configuration_prismatic import OpenVLAConfig  # noqa: F401
-        from prismatic_hf.processing_prismatic import (  # noqa: F401
-            PrismaticImageProcessor,
-            PrismaticProcessor,
-        )
-        from prismatic_hf.modeling_prismatic import (  # noqa: F401
-            OpenVLAForActionPrediction,
-        )
-        AutoConfig.register("openvla", OpenVLAConfig, exist_ok=True)
-        AutoImageProcessor.register(OpenVLAConfig, PrismaticImageProcessor, exist_ok=True)
-        # AutoProcessor & AutoModelForVision2Seq registration handled by the wheel/above import.
+        torch.backends.cuda.enable_flash_sdp(False)
+        torch.backends.cuda.enable_mem_efficient_sdp(False)
+        torch.backends.cuda.enable_math_sdp(True)
     except Exception:
-        # If using a wheel/repo that already registers classes, this is fine.
         pass
 
-    # Device + dtype
+
+@app.on_event("startup")
+def load_model():
+    # Register prismatic classes if they’re not already registered.
+    try:
+        from prismatic_hf.configuration_prismatic import OpenVLAConfig  # noqa
+        from prismatic_hf.processing_prismatic import PrismaticImageProcessor, PrismaticProcessor  # noqa
+        from prismatic_hf.modeling_prismatic import OpenVLAForActionPrediction  # noqa
+
+        AutoConfig.register("openvla", OpenVLAConfig, exist_ok=True)
+        AutoImageProcessor.register(OpenVLAConfig, PrismaticImageProcessor, exist_ok=True)
+        AutoProcessor.register(OpenVLAConfig, PrismaticProcessor, exist_ok=True)
+        AutoModelForVision2Seq.register(OpenVLAConfig, OpenVLAForActionPrediction, exist_ok=True)
+    except Exception:
+        pass
+
     Model.device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
     if Model.device.type == "cuda":
-        Model.dtype = torch.bfloat16 if _cuda_bf16_supported() else torch.float16
-        # Safe perf knobs
         try:
-            torch.backends.cuda.matmul.allow_tf32 = True  # type: ignore[attr-defined]
+            bf16_ok = bool(getattr(torch.cuda, "is_bf16_supported", lambda: False)())
         except Exception:
-            pass
+            bf16_ok = False
+        Model.dtype = torch.bfloat16 if bf16_ok else torch.float16
     else:
         Model.dtype = torch.float32
 
-    # Load processor/model with explicit, writable cache_dir
+    _force_eager_attention()
+
+    # --- load processor (local if possible) ---
     Model.processor = AutoProcessor.from_pretrained(
         MODEL_ID,
+        revision=REVISION,
         trust_remote_code=True,
         cache_dir=CACHE_DIR,
+        local_files_only=LOCAL_ONLY,
+        resume_download=not LOCAL_ONLY,
+        use_fast=True,  # suppresses the "slow processor" warning when available
     )
+
+    # --- load config with forced eager attention ---
+    cfg = AutoConfig.from_pretrained(
+        MODEL_ID,
+        revision=REVISION,
+        trust_remote_code=True,
+        cache_dir=CACHE_DIR,
+        local_files_only=LOCAL_ONLY,
+        resume_download=not LOCAL_ONLY,
+    )
+    # Make both the public and the internal flags explicit.
+    setattr(cfg, "attn_implementation", "eager")
+    setattr(cfg, "_attn_implementation_internal", "eager")
+
+    # --- load model using that config (prevents SDPA probe) ---
     Model.model = AutoModelForVision2Seq.from_pretrained(
         MODEL_ID,
-        torch_dtype=Model.dtype,
+        revision=REVISION,
+        config=cfg,
+        dtype=Model.dtype,                    # newer arg name (torch_dtype is deprecated)
         device_map="auto" if Model.device.type == "cuda" else None,
         trust_remote_code=True,
         cache_dir=CACHE_DIR,
+        local_files_only=LOCAL_ONLY,
+        resume_download=not LOCAL_ONLY,
+        low_cpu_mem_usage=True,
     )
+
     if Model.device.type == "cpu":
         Model.model.to(Model.device)
-
-    # Light warm-up to reduce first-request latency
-    try:
-        img = Image.new("RGB", (64, 64), (0, 0, 0))
-        enc = Model.processor("warmup", img, return_tensors="pt")
-        for k, v in enc.items():
-            if hasattr(v, "to"):
-                enc[k] = v.to(Model.device, dtype=Model.dtype if v.dtype.is_floating_point else None)
-        with torch.inference_mode():
-            _ = Model.model.predict_action(**enc, unnorm_key="bridge_orig")
-    except Exception:
-        # Warmup is best-effort; ignore failures here
-        pass
 
 
 @app.get("/health")
@@ -149,22 +150,19 @@ def health():
     try:
         return JSONResponse(_device_info())
     except Exception as e:
-        return JSONResponse({"ok": False, "error": f"{type(e).__name__}: {e}"})
+        return JSONResponse({"ok": False, "error": repr(e)}, status_code=500)
 
 
 @app.post("/predict")
 async def predict(prompt: str = Form(...), image: UploadFile = Form(...)):
     t0 = time.time()
-
-    # Decode image
     try:
         raw = await image.read()
         img = Image.open(io.BytesIO(raw)).convert("RGB")
     except Exception as e:
         return JSONResponse({"ok": False, "error": f"Bad image: {e}"}, status_code=400)
-    t1 = time.time()
 
-    # Preprocess
+    t1 = time.time()
     try:
         enc = Model.processor(prompt, img, return_tensors="pt")
         for k, v in enc.items():
@@ -172,13 +170,10 @@ async def predict(prompt: str = Form(...), image: UploadFile = Form(...)):
                 enc[k] = v.to(Model.device, dtype=Model.dtype if v.dtype.is_floating_point else None)
     except Exception as e:
         return JSONResponse({"ok": False, "error": f"Processor error: {e}"}, status_code=500)
-    t2 = time.time()
 
-    # Inference
+    t2 = time.time()
     try:
-        with torch.inference_mode():
-            action = Model.model.predict_action(**enc, unnorm_key="bridge_orig")
-        # Normalize to plain Python floats
+        action = Model.model.predict_action(**enc, unnorm_key="bridge_orig")
         if hasattr(action, "detach"):
             action = action.detach().float().cpu().tolist()
         elif hasattr(action, "tolist"):
@@ -187,17 +182,15 @@ async def predict(prompt: str = Form(...), image: UploadFile = Form(...)):
             action = [float(x) for x in action]
     except Exception as e:
         return JSONResponse({"ok": False, "error": f"Inference error: {e}"}, status_code=500)
-    t3 = time.time()
 
-    return JSONResponse(
-        {
-            "ok": True,
-            "action": action,
-            "timings": {
-                "decode_ms": round((t1 - t0) * 1000, 1),
-                "preproc_ms": round((t2 - t1) * 1000, 1),
-                "infer_ms": round((t3 - t2) * 1000, 1),
-                "total_ms": round((t3 - t0) * 1000, 1),
-            },
+    t3 = time.time()
+    return JSONResponse({
+        "ok": True,
+        "action": action,
+        "timings": {
+            "decode_ms": round((t1 - t0) * 1000, 1),
+            "preproc_ms": round((t2 - t1) * 1000, 1),
+            "infer_ms": round((t3 - t2) * 1000, 1),
+            "total_ms": round((t3 - t0) * 1000, 1),
         }
-    )
+    })
